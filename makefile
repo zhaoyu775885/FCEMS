@@ -1,5 +1,5 @@
-ROOT= .
-SRC= src
+ROOT = .
+SRC = src
 
 all:
 	(test -d $(ROOT)/lib || mkdir -p $(ROOT)/lib;)
