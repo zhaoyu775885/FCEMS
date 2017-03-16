@@ -1,4 +1,4 @@
-ROOT= .
+ROOT  = .
 SRC= src
 
 all:
