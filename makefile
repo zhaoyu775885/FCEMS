@@ -1,5 +1,6 @@
-ROOT  = .
-SRC= src
+ROOT = .
+SRC = src
+>>>>>>> debug
 
 all:
 	(test -d $(ROOT)/lib || mkdir -p $(ROOT)/lib;)
