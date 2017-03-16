@@ -1,0 +1,6 @@
+CC = g++
+AR =ar -rc
+FLAGS = -Wall -std=c++11
+OPT_FLAGS = -O3 -fopenmp -msse4.2
+MKL_LIBS = -lmkl_core -lmkl_intel_lp64 -lmkl_sequential -liomp5
+OPENGL_LIBS = -lglut -lGLU -lGL

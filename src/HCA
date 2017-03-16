@@ -1,0 +1,1572 @@
+void
+FastBem::hca_std(phmatrix hm, const Integration &intg, const char c)
+{
+//    cout << hca_times++ << ": use HCA std" << endl;
+    const int inter_num(INTP_ORDER);
+
+    /** parameter for integral **/
+    const double freq(intg.get_freq());
+    const double lambda(Constants::SPEED_OF_LIGHT/freq);
+    const double omega(2*PI*freq);
+
+    const DComplex epsilon_r(1.0);
+    const DComplex wavenum = 2*PI*freq*(1.0/Constants::SPEED_OF_LIGHT)*sqrt(epsilon_r);
+    const DComplex coefA(CJ*omega*MU0), coefV(-CJ/(epsilon_r*EPSILON0*omega));
+
+    const double *rbox_min = hm->rc->bmin;
+    const double *rbox_max = hm->rc->bmax;
+    const double *cbox_min = hm->cc->bmin;
+    const double *cbox_max = hm->cc->bmax;
+    /**
+     ** fixed points number may be too small or too large
+     ** use the space resolution method to select the size adaptively
+     **/
+#if USE_RESOLUTION
+    const double resolution(lambda*0.1);
+    const double rbox_xlen = rbox_max[0] - rbox_min[0];
+    const double rbox_ylen = rbox_max[1] - rbox_min[1];
+    const double rbox_zlen = rbox_max[2] - rbox_min[2];
+    int nx = (int)(rbox_xlen/resolution) + 1;
+    int ny = (int)(rbox_ylen/resolution) + 1;
+    int nz = (int)(rbox_zlen/resolution) + 1;
+#else
+    const int nx(inter_num);
+    const int ny(inter_num);
+    const int nz(inter_num);
+#endif // 0
+//    cout << nx << ", " << ny << ", " << nz << endl;
+    const int rbox_nodes_num = nx*ny*nz;
+
+    /** build the point set for both row cluster and col cluster **/
+
+    vector<Point3D> rbox_nodes_set;
+    #if !USE_CHE
+    double dx = (rbox_max[0] - rbox_min[0]) / (nx+1);
+    for (int i=1;i<=nx;++i) {
+        double dy = (rbox_max[1]-rbox_min[1]) / (ny+1);
+        for (int j=1;j<=ny;++j) {
+            double dz = (rbox_max[2]-rbox_min[2]) / (nz+1);
+            for (int k=1;k<=nz;++k) {
+                Point3D newp(rbox_min[0]+i*dx, rbox_min[1]+j*dy, rbox_min[2]+k*dz);
+                rbox_nodes_set.push_back(newp);
+            }
+        }
+    }
+    #else
+    ChebItp3D row_cheb(nx, ny, nz);
+    double rxa = rbox_min[0], rxb = rbox_max[0];
+    double rya = rbox_min[1], ryb = rbox_max[1];
+    double rza = rbox_min[2], rzb = rbox_max[2];
+    for (int i=0;i<nx;++i) {
+        for (int j=0;j<ny;++j) {
+            for (int k=0;k<nz;++k) {
+                double px = row_cheb.get_cheb_point_x(i, rxa, rxb);
+                double py = row_cheb.get_cheb_point_y(j, rya, ryb);
+                double pz = row_cheb.get_cheb_point_z(k, rza, rzb);
+                rbox_nodes_set.push_back(Point3D(px, py, pz));
+            }
+        }
+    }
+    #endif // 0
+#if USE_RESOLUTION
+    const double cbox_xlen = cbox_max[0] - cbox_min[0];
+    const double cbox_ylen = cbox_max[1] - cbox_min[1];
+    const double cbox_zlen = cbox_max[2] - cbox_min[2];
+    nx = (int)(cbox_xlen/resolution)+1;
+    ny = (int)(cbox_ylen/resolution)+1;
+    nz = (int)(cbox_zlen/resolution)+1;
+#endif // 0
+//    cout << nx << ", " << ny << ", " << nz << endl;
+    const int cbox_nodes_num = nx*ny*nz;
+
+    vector<Point3D> cbox_nodes_set;
+    #if !USE_CHE
+    dx = (cbox_max[0] - cbox_min[0]) / (nx+1);
+    for (int i=1;i<=nx;++i) {
+        double dy = (cbox_max[1]-cbox_min[1]) / (ny+1);
+        for (int j=1;j<=ny;++j) {
+            double dz = (cbox_max[2]-cbox_min[2]) / (nz+1);
+            for (int k=1;k<=nz;++k) {
+                Point3D newp(cbox_min[0]+i*dx, cbox_min[1]+j*dy, cbox_min[2]+k*dz);
+                cbox_nodes_set.push_back(newp);
+            }
+        }
+    }
+    #else
+    ChebItp3D col_cheb(nx, ny, nz);
+    double cxa = cbox_min[0], cxb = cbox_max[0];
+    double cya = cbox_min[1], cyb = cbox_max[1];
+    double cza = cbox_min[2], czb = cbox_max[2];
+    for (int i=0;i<nx;++i) {
+        for (int j=0;j<ny;++j) {
+            for (int k=0;k<nz;++k) {
+                double px = col_cheb.get_cheb_point_x(i, cxa, cxb);
+                double py = col_cheb.get_cheb_point_y(j, cya, cyb);
+                double pz = col_cheb.get_cheb_point_z(k, cza, czb);
+                cbox_nodes_set.push_back(Point3D(px, py, pz));
+            }
+        }
+    }
+    #endif // 0
+    /** Preparation work for generating interpolation points finished **/
+
+    vector<int> pre_row_idx; /// 我们有row & col Flags
+    vector<int> pre_col_idx; /// So, 不需要额外加变量了? No.
+    /// But I think the order of row and col index should not make a difference
+
+    /** ACA parameters **/
+    char norm = 'F';
+    int nrowclu(rbox_nodes_num);
+    int ncolclu(cbox_nodes_num);
+    int tmpRank(0);
+    double frbNormZ(0), frbNormZ_2(0), frbNormU(0), frbNormV(0);
+
+    /** current row and col index **/
+    int curRowNum, curColNum;
+
+    /**  allocate temp space  **/
+    vector<bool> flagRow(nrowclu, true);
+    vector<bool> flagCol(ncolclu, true);
+    vector<DComplex> resRowVal(ncolclu, 0);
+    vector<DComplex> resColVal(nrowclu, 0);
+
+    /** The pivots in each ACA cross selection **/
+    vector<DComplex> pivot_record;
+
+    /** the auxiliary rank-k matrix**/
+    /** Attention: it is for the Green's Function matrix ONLY **/
+    const prkmatrix rkmat = new_rkmatrix(rbox_nodes_num, cbox_nodes_num, 0);
+
+    /**Start from the 0th row**/
+    curRowNum = 0;
+    flagRow[curRowNum] = 0;
+    for (int j=0;j<ncolclu;j++) resRowVal[j] = Green0(rbox_nodes_set[curRowNum], cbox_nodes_set[j], wavenum);
+
+    curColNum = get_next_idx_aca(resRowVal, flagCol);
+    if (curColNum == -1) return ;/** -1 means that none of the elements is available **/
+
+    for (int i=0;i<nrowclu;i++) resColVal[i] = Green0(rbox_nodes_set[i], cbox_nodes_set[curColNum], wavenum);
+    if ( abs( resRowVal[curColNum] ) < 1e-20 )  return ; /// too close to zero is regarded as zero
+    else pivot_record.push_back(resRowVal[curColNum]); /// pivot element recording
+
+    pre_row_idx.push_back(curRowNum); /// record row index of pivot
+    pre_col_idx.push_back(curColNum); /// record col index of pivot
+
+    rkmat->V.a = new DComplex [ncolclu]; /// Now green function rkmat have
+    rkmat->U.a = new DComplex [nrowclu]; /// 1 row and 1 col. So, continue
+
+    for (int j=0;j<ncolclu;j++) rkmat->V.a[j] = resRowVal[j]/resRowVal[curColNum];
+    for (int i=0;i<nrowclu;i++) rkmat->U.a[i] = resColVal[i];
+
+    frbNormV = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, ncolclu, 1, (MKL_Complex16 *)rkmat->V.a, ncolclu);
+    frbNormU = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, nrowclu, 1, (MKL_Complex16 *)rkmat->U.a, nrowclu);
+    frbNormZ = frbNormU * frbNormV;
+    frbNormZ_2 = frbNormZ * frbNormZ;
+
+    while ( frbNormU*frbNormV > aca_threshold*frbNormZ ) {
+        tmpRank++;
+
+        if((curRowNum = get_next_idx_aca(resColVal, flagRow)) == -1) {
+            tmpRank--;
+            break;
+        }
+
+        #pragma omp parallel for
+        for (int j=0;j<ncolclu;j++) {
+            resRowVal[j] = Green0(rbox_nodes_set[curRowNum], cbox_nodes_set[j], wavenum);
+            for (int i=0;i<tmpRank;i++) {
+                resRowVal[j] -= rkmat->U.a[curRowNum+i*nrowclu]*rkmat->V.a[j+i*ncolclu];
+            }
+        }
+
+        if ((curColNum = get_next_idx_aca(resRowVal, flagCol)) == -1) {
+            tmpRank--;
+            break;
+        }
+
+        #pragma omp parallel for
+        for (int i=0;i<nrowclu;i++) {
+            resColVal[i] = Green0(rbox_nodes_set[i], cbox_nodes_set[curColNum], wavenum);
+            for (int j=0;j<tmpRank;j++) {
+                resColVal[i] -= rkmat->U.a[i+j*nrowclu] * rkmat->V.a[curColNum+j*ncolclu];
+            }
+        }
+
+        rkmat->V.a = (DComplex *) realloc(rkmat->V.a, (tmpRank+1)*ncolclu*sizeof(DComplex));
+        rkmat->U.a = (DComplex *) realloc(rkmat->U.a, (tmpRank+1)*nrowclu*sizeof(DComplex));
+
+        pre_row_idx.push_back(curRowNum);
+        pre_col_idx.push_back(curColNum);
+        pivot_record.push_back(resRowVal[curColNum]);
+
+        #pragma omp parallel for
+        for (int j=0;j<ncolclu;j++) rkmat->V.a[j+tmpRank*ncolclu] = resRowVal[j]/resRowVal[curColNum];
+        #pragma omp parallel for
+        for (int i=0;i<nrowclu;i++) rkmat->U.a[i+tmpRank*nrowclu] = resColVal[i];
+
+        frbNormV = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, ncolclu, 1,
+                    (MKL_Complex16 *)rkmat->V.a+tmpRank*ncolclu, ncolclu);
+        frbNormU = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, nrowclu, 1,
+                    (MKL_Complex16 *)rkmat->U.a+tmpRank*nrowclu, nrowclu);
+
+        for (int i=0;i<tmpRank;i++) {
+            DComplex c1, c2;
+            cblas_zdotc_sub(nrowclu, rkmat->U.a+i*nrowclu, 1, rkmat->U.a+tmpRank*nrowclu, 1, &c1);
+            cblas_zdotc_sub(ncolclu, rkmat->V.a+i*ncolclu, 1, rkmat->V.a+tmpRank*ncolclu, 1, &c2);
+            frbNormZ_2 += 2*abs( c1 )*abs( c2 );
+        }
+        frbNormZ_2 += frbNormU*frbNormU*frbNormV*frbNormV;
+        frbNormZ = sqrt(frbNormZ_2);
+    }
+    tmpRank ++;
+
+    /** begin work on the rank k matrix **/
+    nrowclu = hm->rc->size;
+    ncolclu = hm->cc->size;
+
+    /** gs_mat is the submat of Green's Function with cross elements of ACA **/
+    /** ks_mat equals C * Dt, and is also the general inverse of gs_mat **/
+    DComplex *gs_mat = new DComplex [tmpRank*tmpRank];
+    Complex3D *newa_vec = new Complex3D [tmpRank*nrowclu];
+    Complex3D *newb_vec = new Complex3D [tmpRank*ncolclu];
+
+    prkmatrix rk_sca   = new_rkmatrix(nrowclu, ncolclu, tmpRank);
+    prkmatrix rk_vec_x = new_rkmatrix(nrowclu, ncolclu, tmpRank);
+    prkmatrix rk_vec_y = new_rkmatrix(nrowclu, ncolclu, tmpRank);
+    prkmatrix rk_vec_z = new_rkmatrix(nrowclu, ncolclu, tmpRank);
+
+    #pragma omp parallel for
+    for (int i=0;i<tmpRank;++i) {
+        for (int j=0;j<tmpRank;++j) {
+            gs_mat[i+j*tmpRank] = Green0(rbox_nodes_set[pre_row_idx[i]],
+                                         cbox_nodes_set[pre_col_idx[j]], wavenum);
+        }
+    }
+    /// This gs_mat is still with low rank.
+
+    vector<int> srow_flag(tmpRank, 1);
+    vector<int> scol_flag(tmpRank, 1);
+    vector<int> row_idx;
+    vector<int> col_idx;
+    int curRank = full_col_pivot_aca(gs_mat, srow_flag, scol_flag);
+
+    for (int i=0;i<tmpRank;++i) {
+        if (srow_flag[i]==0) {
+            row_idx.push_back(pre_row_idx[i]);
+        }
+        if (scol_flag[i]==0) col_idx.push_back(pre_col_idx[i]);
+    }
+//    cout << "m = " << nrowclu << ", n = " << ncolclu << ", rank = " << curRank << endl;
+
+    DComplex *ks_mat = new DComplex [curRank*curRank];
+    int ts_row(0);
+    for (int i=0;i<tmpRank;++i) {
+        if (!srow_flag[i]) {
+            int ts_col = 0;
+            for (int j=0;j<tmpRank;++j) {
+                if (!scol_flag[j]) {
+                    ks_mat[ts_row+ts_col*curRank] = gs_mat[i+j*tmpRank];
+                    ts_col++;
+                }
+            }
+            ts_row++;
+        }
+    }
+
+
+
+    #if 0
+    /** This implement of HCA is problematic.
+    DComplex * matC = new DComplex [tmpRank*tmpRank]; /// upper triangle matrix
+    DComplex * matD = new DComplex [tmpRank*tmpRank]; /// upper triangle matrix
+    for (int i=0;i<tmpRank*tmpRank;++i) matC[i] = matD[i] = 0;
+    for (int l=0;l<tmpRank;++l) {
+        vector<DComplex> vecC(l);
+        vector<DComplex> vecD(l);
+        for (int i=0;i<l;++i) {
+            vecC[i] = vecD[i] = 0;
+            for (int j=0;j<=i;++j) {
+                vecC[i] += matC[j+i*tmpRank]*gs_mat[l+j*tmpRank];
+                vecD[i] += matD[j+i*tmpRank]*gs_mat[j+l*tmpRank];
+            }
+        }
+        DComplex tmpPivot = 1.0 / sqrt(pivot_record[l]);
+        matC[l+l*tmpRank] = tmpPivot;
+        matD[l+l*tmpRank] = tmpPivot;
+        for (int i=0;i<l;++i) {
+            matC[i+l*tmpRank] = 0;
+            matD[i+l*tmpRank] = 0;
+            for (int j=i;j<l;++j) {
+                matC[i+l*tmpRank] -= matC[i+j*tmpRank]*vecD[j]*tmpPivot;
+                matD[i+l*tmpRank] -= matD[i+j*tmpRank]*vecC[j]*tmpPivot;
+            }
+        }
+    }
+	#if 0
+    if (print == 0 && hca_times == 4) {
+        print = 1;
+        ofstream ofpres("./output/pres.txt");
+        ofstream ofs("./output/s.txt");
+        ofstream ofc("./output/matc.txt");
+        ofstream ofd("./output/matd.txt");
+        for (int i=0;i<tmpRank;++i) {
+            for (int j=0;j<tmpRank;++j) {
+                ofc << matC[i+j*tmpRank] << " ";
+                ofd << matD[i+j*tmpRank] << " ";
+                ofpres << gs_mat[i+j*tmpRank] << " ";
+                ofs << ks_mat[i+j*tmpRank] << " ";
+            }
+            ofc << endl;
+            ofd << endl;
+            ofs << endl;
+            ofpres << endl;
+        }
+        ofc.close();
+        ofd.close();
+        ofs.close();
+        ofpres.close();
+    }
+    #endif // 0
+    /// ks = C * Dt (the D here was not conjugated)
+    mmp_z(matC, CblasNoTrans, matD, CblasTrans, ks_mat, tmpRank, tmpRank, tmpRank);
+    **/
+
+    delete [] matC;
+    delete [] matD;
+    #else
+    matInv_z(ks_mat, curRank);
+    #endif // 0
+
+    delete [] gs_mat;
+
+    #pragma omp parallel for
+    for (int j=0;j<curRank;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            intg.single_layer_intg(hm->rc->idx[i], cbox_nodes_set[col_idx[j]],
+                                newa_vec[i+nrowclu*j], rk_sca->U.a[i+nrowclu*j]);
+        }
+        for (int i=0;i<ncolclu;++i) {
+            intg.single_layer_intg(hm->cc->idx[i], rbox_nodes_set[row_idx[j]],
+                                newb_vec[i+ncolclu*j], rk_sca->V.a[i+ncolclu*j]);
+        }
+    }
+    #pragma omp parallel for
+    for (int j=0;j<curRank;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            rk_vec_x->U.a[i+nrowclu*j] = coefA*newa_vec[i+nrowclu*j][0];
+            rk_vec_y->U.a[i+nrowclu*j] = coefA*newa_vec[i+nrowclu*j][1];
+            rk_vec_z->U.a[i+nrowclu*j] = coefA*newa_vec[i+nrowclu*j][2];
+            rk_sca->U.a[i+nrowclu*j] *= coefV;
+        }
+        for (int i=0;i<ncolclu;++i) {
+            rk_vec_x->V.a[i+ncolclu*j] = newb_vec[i+ncolclu*j][0];
+            rk_vec_y->V.a[i+ncolclu*j] = newb_vec[i+ncolclu*j][1];
+            rk_vec_z->V.a[i+ncolclu*j] = newb_vec[i+ncolclu*j][2];
+        }
+    }
+
+    prkmatrix rk_vec_nx = new_rkmatrix(nrowclu, ncolclu, curRank);
+    prkmatrix rk_vec_ny = new_rkmatrix(nrowclu, ncolclu, curRank);
+    prkmatrix rk_vec_nz = new_rkmatrix(nrowclu, ncolclu, curRank);
+    prkmatrix rk_sca_n  = new_rkmatrix(nrowclu, ncolclu, curRank);
+    copy_rkmatrix(0, rk_vec_x, rk_vec_nx);
+    copy_rkmatrix(0, rk_vec_y, rk_vec_ny);
+    copy_rkmatrix(0, rk_vec_z, rk_vec_nz);
+    copy_rkmatrix(0, rk_sca,   rk_sca_n);
+
+    mmp_z(rk_vec_x->U.a, CblasNoTrans, ks_mat, CblasNoTrans, rk_vec_nx->U.a, nrowclu, curRank, curRank);
+    mmp_z(rk_vec_y->U.a, CblasNoTrans, ks_mat, CblasNoTrans, rk_vec_ny->U.a, nrowclu, curRank, curRank);
+    mmp_z(rk_vec_z->U.a, CblasNoTrans, ks_mat, CblasNoTrans, rk_vec_nz->U.a, nrowclu, curRank, curRank);
+    mmp_z(rk_sca->U.a,   CblasNoTrans, ks_mat, CblasNoTrans, rk_sca_n->U.a,  nrowclu, curRank, curRank);
+    delete [] ks_mat;
+
+    conj_amatrix(&(rk_vec_nx->V));
+    conj_amatrix(&(rk_vec_ny->V));
+    conj_amatrix(&(rk_vec_nz->V));
+    conj_amatrix(&(rk_sca_n->V));
+
+    copy_rkmatrix(false, rk_vec_nx, hm->r);
+    ptruncmode tm = new_truncmode();
+    add_rkmatrix_keep_rank(1.0, rk_vec_ny, hm->r);
+    add_rkmatrix_keep_rank(1.0, rk_vec_nz, hm->r);
+//    add_rkmatrix(1.0, rk_sca_n,  tm, 1e-1, hm->r);
+
+    hm->r->U.a = (DComplex *) realloc(hm->r->U.a, (hm->r->k+rk_sca_n->k)*nrowclu*sizeof(DComplex));
+    hm->r->V.a = (DComplex *) realloc(hm->r->V.a, (hm->r->k+rk_sca_n->k)*ncolclu*sizeof(DComplex));
+    hm->r->U.cols = hm->r->k+rk_sca_n->k;
+    hm->r->V.cols = hm->r->k+rk_sca_n->k;
+
+    #pragma omp parallel for
+    for (int i=0;i<rk_sca_n->k;++i) {
+        for (int j=0;j<nrowclu;++j) {
+            hm->r->U.a[j+(i+hm->r->k)*nrowclu] = rk_sca_n->U.a[j+i*nrowclu];
+        }
+        for (int j=0;j<ncolclu;++j) {
+            hm->r->V.a[j+(i+hm->r->k)*ncolclu] = rk_sca_n->V.a[j+i*ncolclu];
+        }
+    }
+    hm->r->k +=rk_sca_n->k;
+
+    del_rkmatrix(rk_vec_nx);
+    del_rkmatrix(rk_vec_ny);
+    del_rkmatrix(rk_vec_nz);
+    del_rkmatrix(rk_sca_n);
+
+    delete [] newa_vec;
+    delete [] newb_vec;
+    del_rkmatrix(rk_vec_x);
+    del_rkmatrix(rk_vec_y);
+    del_rkmatrix(rk_vec_z);
+    del_rkmatrix(rk_sca);
+
+    #if TST_HMATRIX_ERROR
+    /** Full SVD to verify the performance of ACA **/
+    /** Or just to compute the error matrix ||Z-Z^hat||2 directly  **/
+    DComplex *Z = new DComplex [nrowclu*ncolclu];
+    DComplex *aca_Z = new DComplex [nrowclu*ncolclu];
+
+    mmp_z(hm->r->U.a, CblasNoTrans, hm->r->V.a, CblasConjTrans, aca_Z, nrowclu, hm->r->k, ncolclu);
+    #pragma omp parallel for
+    for (int i=0;i<nrowclu;++i) {
+        for (int j=0;j<ncolclu;++j) {
+            Z[i+j*nrowclu] = intg.xfie(hm->rc->idx[i], hm->cc->idx[j], c);
+        }
+    }
+    for (int i=0;i<nrowclu;++i) {
+        for (int j=0;j<ncolclu;++j) {
+            DComplex tmp = Z[i+j*nrowclu];
+            frob_norm_2_total += abs(tmp*tmp);
+            tmp -= aca_Z[i+j*nrowclu];
+            frob_norm_error_2_abs += abs(tmp*tmp);
+        }
+    }
+
+    delete [] Z;
+    delete [] aca_Z;
+    #endif // 0
+}
+
+
+void
+FastBem::hca_naive(phmatrix hm, const Integration &intg, const char c)
+{
+//    cout << hca_times++ << ": use HCA" << endl;
+    const int inter_num(INTP_ORDER);
+
+    /** parameter for integral **/
+    const double freq(intg.get_freq());
+    const double lambda(Constants::SPEED_OF_LIGHT/freq);
+    const double omega(2*PI*freq);
+    const DComplex epsilon_r(1.0);
+    const DComplex wavenum = 2*PI*freq*(1.0/Constants::SPEED_OF_LIGHT)*sqrt(epsilon_r);
+    const DComplex coefA(CJ*omega*MU0), coefV(-CJ/(epsilon_r*EPSILON0*omega));
+
+    const double *rbox_min = hm->rc->bmin;
+    const double *rbox_max = hm->rc->bmax;
+    const double *cbox_min = hm->cc->bmin;
+    const double *cbox_max = hm->cc->bmax;
+
+    /**
+     ** fixed points number may be too small or too large
+     ** use the space resolution method to select the size adaptively
+     **/
+#if 1
+    const double resolution(lambda*0.2);
+
+    const double rbox_xlen = rbox_max[0] - rbox_min[0];
+    const double rbox_ylen = rbox_max[1] - rbox_min[1];
+    const double rbox_zlen = rbox_max[2] - rbox_min[2];
+    int nx = (int)(rbox_xlen/resolution) + 1;
+    int ny = (int)(rbox_ylen/resolution) + 1;
+    int nz = (int)(rbox_zlen/resolution) + 1;
+//    int nx = rbox_xlen < 1e-9? 1 : max((int)(rbox_xlen/resolution) + 2, inter_num);
+//    int ny = rbox_ylen < 1e-9? 1 : max((int)(rbox_ylen/resolution) + 2, inter_num);
+//    int nz = rbox_zlen < 1e-9? 1 : max((int)(rbox_zlen/resolution) + 2, inter_num);
+//    cout << nx << ", " << ny << ", " << nz << endl;
+#else
+    const int nx(inter_num);
+    const int ny(inter_num);
+    const int nz(inter_num);
+#endif // 0
+    const int rbox_nodes_num = nx*ny*nz;
+
+    /** build the point set for both row cluster and col cluster **/
+    vector<Point3D> rbox_nodes_set;
+    double dx = (rbox_max[0] - rbox_min[0]) / (nx+1);
+    for (int i=1;i<=nx;++i) {
+        double dy = (rbox_max[1]-rbox_min[1]) / (ny+1);
+        for (int j=1;j<=ny;++j) {
+            double dz = (rbox_max[2]-rbox_min[2]) / (nz+1);
+            for (int k=1;k<=nz;++k) {
+                Point3D newp(rbox_min[0]+i*dx, rbox_min[1]+j*dy, rbox_min[2]+k*dz);
+                rbox_nodes_set.push_back(newp);
+            }
+        }
+    }
+#if 1
+    const double cbox_xlen = cbox_max[0] - cbox_min[0];
+    const double cbox_ylen = cbox_max[1] - cbox_min[1];
+    const double cbox_zlen = cbox_max[2] - cbox_min[2];
+    nx = (int)(cbox_xlen/resolution) + 1;
+    ny = (int)(cbox_ylen/resolution) + 1;
+    nz = (int)(cbox_zlen/resolution) + 1;
+//    nx = rbox_xlen < 1e-9? 1 : max((int)(cbox_xlen/resolution)+2, inter_num);
+//    ny = rbox_ylen < 1e-9? 1 : max((int)(cbox_ylen/resolution)+2, inter_num);
+//    nz = rbox_zlen < 1e-9? 1 : max((int)(cbox_zlen/resolution)+2, inter_num);
+//    cout << nx << ", " << ny << ", " << nz << endl;
+#endif // 0
+    const int cbox_nodes_num = nx*ny*nz;
+
+    vector<Point3D> cbox_nodes_set;
+    dx = (cbox_max[0] - cbox_min[0]) / (nx+1);
+    for (int i=1;i<=nx;++i) {
+        double dy = (cbox_max[1]-cbox_min[1]) / (ny+1);
+        for (int j=1;j<=ny;++j) {
+            double dz = (cbox_max[2]-cbox_min[2]) / (nz+1);
+            for (int k=1;k<=nz;++k) {
+                Point3D newp(cbox_min[0]+i*dx, cbox_min[1]+j*dy, cbox_min[2]+k*dz);
+                cbox_nodes_set.push_back(newp);
+            }
+        }
+    }
+    /** Preparation work for generating interpolation points finished **/
+
+    vector<int> pre_row_idx; /// 我们有row & col Flags
+    vector<int> pre_col_idx; /// So, 不需要额外加变量了? No.
+    /// But I think the order of row and col index should not make a difference
+    /// In HCA, the index of row and col is more important than the rk representation by ACA
+    /// Because the final rk-matrix is built through single layer integral
+
+    /** ACA required parameters **/
+    char norm = 'F';
+    int nrowclu(rbox_nodes_num);
+    int ncolclu(cbox_nodes_num);
+    int tmpRank(0);
+    double frbNormZ, frbNormZ_2, frbNormU, frbNormV;
+
+    /** record the current row and col index **/
+    int curRowNum, curColNum;
+
+    /**  allocate temp space  **/
+    vector<int> flagRow(nrowclu, 1);
+    vector<int> flagCol(ncolclu, 1);
+    vector<DComplex> resRowVal(ncolclu, 0);
+    vector<DComplex> resColVal(nrowclu, 0);
+
+    DComplex *table = new DComplex [nrowclu*ncolclu];
+
+    /** the auxiliary rank-k matrix**/
+    /** Attention: it is for the Green's Function matrix, not the final rank-k hmatrix **/
+    const prkmatrix rkmat = new_rkmatrix(rbox_nodes_num, cbox_nodes_num, 0);
+
+    /**Start from the 0th row**/
+    curRowNum = 0;
+    flagRow[curRowNum] = 0;
+    for (int j=0;j<ncolclu;j++) {
+        table[curRowNum+j*nrowclu] = resRowVal[j] = Green0(rbox_nodes_set[curRowNum], cbox_nodes_set[j], wavenum);
+    }
+
+    /** Return value -1 means that all  **/
+    curColNum = get_next_idx_aca(resRowVal, flagCol);
+    if (curColNum == -1) return ;
+
+    for (int i=0;i<nrowclu;i++) {
+        table[i+curColNum*nrowclu] = resColVal[i] = Green0(rbox_nodes_set[i], cbox_nodes_set[curColNum], wavenum);
+    }
+    if ( abs( resRowVal[curColNum] ) < 1e-20 )  return ; // too close to zero is regarded as zero matrix
+
+    pre_row_idx.push_back(curRowNum);   // record which row is selected in ACA
+    pre_col_idx.push_back(curColNum);   // record which col is selected in ACA
+
+    rkmat->V.a = new DComplex [ncolclu];
+    rkmat->U.a = new DComplex [nrowclu];
+
+    for (int j=0;j<ncolclu;j++) rkmat->V.a[j] = resRowVal[j]/resRowVal[curColNum];
+    for (int i=0;i<nrowclu;i++) rkmat->U.a[i] = resColVal[i];
+
+    frbNormV = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, ncolclu, 1, (MKL_Complex16 *)rkmat->V.a, ncolclu);
+    frbNormU = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, nrowclu, 1, (MKL_Complex16 *)rkmat->U.a, nrowclu);
+    frbNormZ = frbNormU * frbNormV;
+    frbNormZ_2 = frbNormZ * frbNormZ;
+
+    while ( frbNormU*frbNormV > aca_threshold*frbNormZ ) {
+        tmpRank++;
+
+        if((curRowNum = get_next_idx_aca(resColVal, flagRow)) == -1) {
+            tmpRank--;
+            break;
+        }
+
+        #pragma omp parallel for
+        for (int j=0;j<ncolclu;j++) {
+            resRowVal[j] = Green0(rbox_nodes_set[curRowNum], cbox_nodes_set[j], wavenum);
+            table[curRowNum+j*nrowclu] = resRowVal[j];
+            for (int i=0;i<tmpRank;i++) {
+                resRowVal[j] -= rkmat->U.a[curRowNum+i*nrowclu]*rkmat->V.a[j+i*ncolclu];
+            }
+        }
+
+        if ((curColNum = get_next_idx_aca(resRowVal, flagCol)) == -1) {
+            tmpRank--;
+            break;
+        }
+
+        #pragma omp parallel for
+        for (int i=0;i<nrowclu;i++) {
+            resColVal[i] = Green0(rbox_nodes_set[i], cbox_nodes_set[curColNum], wavenum);
+            table[i+curColNum*nrowclu] = resColVal[i];
+            for (int j=0;j<tmpRank;j++) {
+                resColVal[i] -= rkmat->U.a[i+j*nrowclu] * rkmat->V.a[curColNum+j*ncolclu];
+            }
+        }
+
+        rkmat->V.a = (DComplex *) realloc(rkmat->V.a, (tmpRank+1)*ncolclu*sizeof(DComplex));
+        rkmat->U.a = (DComplex *) realloc(rkmat->U.a, (tmpRank+1)*nrowclu*sizeof(DComplex));
+
+        pre_row_idx.push_back(curRowNum);
+        pre_col_idx.push_back(curColNum);
+
+        #pragma omp parallel for
+        for (int j=0;j<ncolclu;j++) rkmat->V.a[j+tmpRank*ncolclu] = resRowVal[j]/resRowVal[curColNum];
+        #pragma omp parallel for
+        for (int i=0;i<nrowclu;i++) rkmat->U.a[i+tmpRank*nrowclu] = resColVal[i];
+
+        frbNormV = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, ncolclu, 1, (MKL_Complex16 *)rkmat->V.a+tmpRank*ncolclu, ncolclu);
+        frbNormU = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, nrowclu, 1, (MKL_Complex16 *)rkmat->U.a+tmpRank*nrowclu, nrowclu);
+
+        for (int i=0;i<tmpRank;i++) {
+            DComplex c1, c2;
+            cblas_zdotc_sub(nrowclu, rkmat->U.a+i*nrowclu, 1, rkmat->U.a+tmpRank*nrowclu, 1, &c1);
+            cblas_zdotc_sub(ncolclu, rkmat->V.a+i*ncolclu, 1, rkmat->V.a+tmpRank*ncolclu, 1, &c2);
+            frbNormZ_2 += 2*abs( c1 )*abs( c2 );
+        }
+        frbNormZ_2 += frbNormU*frbNormU*frbNormV*frbNormV;
+        frbNormZ = sqrt(frbNormZ_2);
+    }
+
+    tmpRank ++;
+
+    nrowclu = hm->rc->size;
+    ncolclu = hm->cc->size;
+//    cout << "m = " << nrowclu << ", n = " << ncolclu << ", rank = " << tmpRank << endl;
+
+    #if 0
+    for (int i=0;i<nrowclu;++i) {
+        if (!flagRow[i])
+            cout << i << " is selected" << endl;
+    }
+    cout << endl;
+    for (int i=0;i<ncolclu;++i) {
+        if (!flagCol[i])
+            cout << i << " is selected" << endl;
+    }
+    cout << endl;
+    cout << "row idx: " << endl;
+    for (vector<int>::iterator it=pre_row_idx.begin();it!=pre_row_idx.end();++it)
+        cout << *it << " ";
+    cout << endl;
+    cout << "col idx: " << endl;
+    for (vector<int>::iterator it=pre_col_idx.begin();it!=pre_col_idx.end();++it)
+        cout << *it << " ";
+    cout << endl;
+    cout << endl << endl;
+    #endif // 1
+
+    DComplex *gs_mat = new DComplex [tmpRank*tmpRank];
+    Complex3D *newa_vec = new Complex3D [tmpRank*nrowclu];
+    DComplex *newa_sca = new DComplex [tmpRank*nrowclu];
+    Complex3D *newb_vec = new Complex3D [tmpRank*ncolclu];
+    DComplex *newb_sca = new DComplex [tmpRank*ncolclu];
+
+    prkmatrix rk_vec_x = new_rkmatrix(nrowclu, ncolclu, tmpRank);
+    prkmatrix rk_vec_y = new_rkmatrix(nrowclu, ncolclu, tmpRank);
+    prkmatrix rk_vec_z = new_rkmatrix(nrowclu, ncolclu, tmpRank);
+
+    #pragma omp parallel for
+    for (int i=0;i<tmpRank;++i) {
+        for (int j=0;j<tmpRank;++j) {
+            gs_mat[i+j*tmpRank] = table[pre_row_idx[i]+pre_col_idx[j]*rbox_nodes_num];
+        }
+    }/// This S matrix is still low rank, so direct inverse is not feasible.
+
+    delete [] table;
+
+    vector<int> srow_flag(tmpRank, 1);
+    vector<int> scol_flag(tmpRank, 1);
+    vector<int> row_idx;
+    vector<int> col_idx;
+    int curRank = full_col_pivot_aca(gs_mat, srow_flag, scol_flag);
+
+    for (int i=0;i<tmpRank;++i) {
+        if (srow_flag[i]==0) {
+            row_idx.push_back(pre_row_idx[i]);
+        }
+        if (scol_flag[i]==0) col_idx.push_back(pre_col_idx[i]);
+    }
+
+//    cout << "For kernel S matrix, Real rank = " << curRank << endl;
+
+    DComplex *ks_mat = new DComplex [curRank*curRank];
+
+    int ts_row(0);
+    for (int i=0;i<tmpRank;++i) {
+        if (!srow_flag[i]) {
+            int ts_col = 0;
+            for (int j=0;j<tmpRank;++j) {
+                if (!scol_flag[j]) {
+                    ks_mat[ts_row+ts_col*curRank] = gs_mat[i+j*tmpRank];
+                    ts_col++;
+                }
+            }
+            ts_row++;
+        }
+    }
+
+    #if 0
+    double rnorm = LAPACKE_zlange(LAPACK_COL_MAJOR, '1', curRank, curRank, (MKL_Complex16 *)S, curRank);
+    cout << "the norm is : " << rnorm << endl;
+    double rcond;
+    cout << "begin cond computation" << endl;
+    LAPACKE_zgecon(LAPACK_COL_MAJOR, '1', curRank, (MKL_Complex16 *)S, curRank, rnorm, &rcond);
+    cout << rcond << endl;
+    cout << "finish the cond computation" << endl;
+    #endif // 0
+
+    matInv_z(ks_mat, curRank);
+
+    #pragma omp parallel for
+    for (int j=0;j<curRank;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            intg.single_layer_intg(hm->rc->idx[i], cbox_nodes_set[col_idx[j]],
+                                newa_vec[i+nrowclu*j], newa_sca[i+nrowclu*j]);
+        }
+        for (int i=0;i<ncolclu;++i) {
+            intg.single_layer_intg(hm->cc->idx[i], rbox_nodes_set[row_idx[j]],
+                                newb_vec[i+ncolclu*j], newb_sca[i+ncolclu*j]);
+        }
+    }
+
+    #if 0
+
+    DComplex *tst = new DComplex [nrowclu*ncolclu];
+    int real_rank = min(nrowclu, ncolclu);
+    double *sigma = new double [real_rank];
+    double *work = new double [max(nrowclu, ncolclu)];
+
+    for (int j=0;j<ncolclu;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            tst[i+j*nrowclu] = 0;
+            for (int k=0;k<curRank;k++) {
+                tst[i+j*nrowclu] += dotprod(newa_vec[i+nrowclu*k], newb_vec[j+ncolclu*k]);
+            }
+        }
+    }
+
+    MKL_Complex16 *u, *vt;
+    LAPACKE_zgesvd(h2_col_major, 'N', 'N', nrowclu, ncolclu, (MKL_Complex16 *)tst, nrowclu, sigma, u, 1, vt, 1, work);
+//    for (int i=0;i<real_rank;++i)
+//        cout << i<< ": " << sigma[i] << endl;
+
+    delete [] tst;
+    delete [] sigma;
+    delete [] work;
+    #endif // 1
+
+    #pragma omp parallel for
+    for (int j=0;j<curRank;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            rk_vec_x->U.a[i+nrowclu*j] = coefA*newa_vec[i+nrowclu*j][0];
+            rk_vec_y->U.a[i+nrowclu*j] = coefA*newa_vec[i+nrowclu*j][1];
+            rk_vec_z->U.a[i+nrowclu*j] = coefA*newa_vec[i+nrowclu*j][2];
+            newa_sca[i+nrowclu*j] *= coefV;
+        }
+        for (int i=0;i<ncolclu;++i) {
+            rk_vec_x->V.a[i+ncolclu*j] = newb_vec[i+ncolclu*j][0];
+            rk_vec_y->V.a[i+ncolclu*j] = newb_vec[i+ncolclu*j][1];
+            rk_vec_z->V.a[i+ncolclu*j] = newb_vec[i+ncolclu*j][2];
+        }
+    }
+
+    #if 0
+    hm->r->U.a = new DComplex [4*curRank*nrowclu];
+    hm->r->V.a = new DComplex [4*curRank*ncolclu];
+    DComplex * const U = hm->r->U.a;
+    DComplex * const V = hm->r->V.a;
+
+    mmp_z(rk_vec_x->U.a, CblasNoTrans, S, CblasNoTrans, U, nrowclu, curRank, curRank);
+    mmp_z(rk_vec_y->U.a, CblasNoTrans, S, CblasNoTrans, U+curRank*nrowclu, nrowclu, curRank, curRank);
+    mmp_z(rk_vec_z->U.a, CblasNoTrans, S, CblasNoTrans, U+2*curRank*nrowclu, nrowclu, curRank, curRank);
+    mmp_z(newa_sca, CblasNoTrans, S, CblasNoTrans, U+3*curRank*nrowclu, nrowclu, curRank, curRank);
+    for (int j=0;j<curRank;++j) {
+        for (int i=0;i<ncolclu;++i) {
+            V[i+ncolclu*j] = rk_vec_x->V.a[i+ncolclu*j];
+            V[i+ncolclu*(j+curRank)] = rk_vec_y->V.a[i+ncolclu*j];
+            V[i+ncolclu*(j+2*curRank)] = rk_vec_z->V.a[i+ncolclu*j];
+            V[i+ncolclu*(j+3*curRank)] = newb_sca[i+ncolclu*j];
+        }
+    }
+
+    hm->r->k = 4*curRank;
+    hm->r->U.rows = nrowclu;
+    hm->r->U.cols = hm->r->k;
+    hm->r->V.rows = ncolclu;
+	hm->r->V.cols = hm->r->k;
+    conj_amatrix(&(hm->r->V));
+
+	ptruncmode tm = new_truncmode();
+	trunc_rkmatrix(tm, 1e-1, hm->r);
+	#endif // 0
+
+	#if 1
+    prkmatrix rk_vec_nx = new_rkmatrix(nrowclu, ncolclu, curRank);
+    prkmatrix rk_vec_ny = new_rkmatrix(nrowclu, ncolclu, curRank);
+    prkmatrix rk_vec_nz = new_rkmatrix(nrowclu, ncolclu, curRank);
+
+    copy_rkmatrix(0, rk_vec_x, rk_vec_nx);
+    copy_rkmatrix(0, rk_vec_y, rk_vec_ny);
+    copy_rkmatrix(0, rk_vec_z, rk_vec_nz);
+
+    hm->r->U.a = new DComplex [2*curRank*nrowclu];
+    hm->r->V.a = new DComplex [2*curRank*ncolclu];
+    DComplex * const U = hm->r->U.a;
+    DComplex * const V = hm->r->V.a;
+
+    mmp_z(rk_vec_x->U.a, CblasNoTrans, ks_mat, CblasNoTrans, rk_vec_nx->U.a, nrowclu, curRank, curRank);
+    mmp_z(rk_vec_y->U.a, CblasNoTrans, ks_mat, CblasNoTrans, rk_vec_ny->U.a, nrowclu, curRank, curRank);
+    mmp_z(rk_vec_z->U.a, CblasNoTrans, ks_mat, CblasNoTrans, rk_vec_nz->U.a, nrowclu, curRank, curRank);
+
+    conj_amatrix(&(rk_vec_nx->V));
+    conj_amatrix(&(rk_vec_ny->V));
+    conj_amatrix(&(rk_vec_nz->V));
+
+    add_rkmatrix_keep_rank(1.0, rk_vec_nx, rk_vec_ny);
+    add_rkmatrix_keep_rank(1.0, rk_vec_ny, rk_vec_nz);
+
+    #pragma omp parallel for
+    for (int j=0;j<curRank;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            U[i+j*nrowclu] = rk_vec_nz->U.a[i+j*nrowclu];
+        }
+    }
+    mmp_z(newa_sca, CblasNoTrans, ks_mat, CblasNoTrans, U+curRank*nrowclu, nrowclu, curRank, curRank);
+
+    #pragma omp parallel for
+    for (int j=0;j<curRank;++j) {
+        for (int i=0;i<ncolclu;++i) {
+            V[i+ncolclu*j] = rk_vec_nz->V.a[i+ncolclu*j];
+            V[i+ncolclu*(j+curRank)] = conj(newb_sca[i+ncolclu*j]);
+        }
+    }
+    hm->r->k = curRank*2;
+    hm->r->U.rows = nrowclu;
+    hm->r->U.cols = hm->r->k;
+    hm->r->V.rows = ncolclu;
+	hm->r->V.cols = hm->r->k;
+
+    del_rkmatrix(rk_vec_nx);
+    del_rkmatrix(rk_vec_ny);
+    del_rkmatrix(rk_vec_nz);
+
+    #else
+
+    hm->r->U.a = new DComplex [2*curRank*nrowclu];
+    hm->r->V.a = new DComplex [2*curRank*ncolclu];
+    DComplex * const U = hm->r->U.a;
+    DComplex * const V = hm->r->V.a;
+
+    conj_amatrix(&(rk_vec_x->V));
+    conj_amatrix(&(rk_vec_y->V));
+    conj_amatrix(&(rk_vec_z->V));
+    add_rkmatrix_keep_rank(1.0, rk_vec_x, rk_vec_y);
+    add_rkmatrix_keep_rank(1.0, rk_vec_y, rk_vec_z);
+    conj_amatrix(&(rk_vec_z->V));
+
+    mmp_z(rk_vec_z->U.a, CblasNoTrans, S, CblasNoTrans, U, nrowclu, curRank, curRank);
+    mmp_z(newa_sca, CblasNoTrans, S, CblasNoTrans, U+curRank*nrowclu, nrowclu, curRank, curRank);
+
+    for (int j=0;j<curRank;++j) {
+        for (int i=0;i<ncolclu;++i) {
+            V[i+ncolclu*j] = rk_vec_z->V.a[i+ncolclu*j];
+            V[i+ncolclu*(j+curRank)] = newb_sca[i+ncolclu*j];
+        }
+    }
+    hm->r->k = 2*curRank;
+    hm->r->U.rows = nrowclu;
+    hm->r->U.cols = hm->r->k;
+    hm->r->V.rows = ncolclu;
+	hm->r->V.cols = hm->r->k;
+    conj_amatrix(&(hm->r->V));
+
+    #endif // 0
+
+    delete [] gs_mat;
+    delete [] ks_mat;
+    delete [] newa_sca;
+    delete [] newb_sca;
+    delete [] newa_vec;
+    delete [] newb_vec;
+    del_rkmatrix(rk_vec_x);
+    del_rkmatrix(rk_vec_y);
+    del_rkmatrix(rk_vec_z);
+
+    #if TST_HMATRIX_ERROR
+    /** Full SVD to verify the performance of ACA **/
+    /** Or just to compute the error matrix ||Z-Z^hat||2 directly  **/
+    DComplex *Z = new DComplex [nrowclu*ncolclu];
+    DComplex *aca_Z = new DComplex [nrowclu*ncolclu];
+
+    mmp_z(hm->r->U.a, CblasNoTrans, hm->r->V.a, CblasConjTrans, aca_Z, nrowclu, hm->r->k, ncolclu);
+    #pragma omp parallel for
+    for (int i=0;i<nrowclu;++i) {
+        for (int j=0;j<ncolclu;++j) {
+            Z[i+j*nrowclu] = intg.xfie(hm->rc->idx[i], hm->cc->idx[j], c);
+        }
+    }
+    for (int i=0;i<nrowclu;++i) {
+        for (int j=0;j<ncolclu;++j) {
+            DComplex tmp = Z[i+j*nrowclu];
+            frob_norm_2_total += abs(tmp*tmp);
+            tmp -= aca_Z[i+j*nrowclu];
+            frob_norm_error_2_abs += abs(tmp*tmp);
+        }
+    }
+
+    #if 0
+    double *sigma = new double [max(nrowclu, ncolclu)];
+    double *work = new double [max(nrowclu, ncolclu)];
+    MKL_Complex16 *u, *vt;
+    LAPACKE_zgesvd(h2_col_major, 'N', 'N', nrowclu, ncolclu, (MKL_Complex16 *)Z, nrowclu, sigma, u, 1, vt, 1, work);
+    int real_rank = min(nrowclu, ncolclu);
+    for (int i=0;i<real_rank;++i)
+        cout << i<< ": " << sigma[i] << endl;
+    delete [] sigma;
+    delete [] work;
+    #endif // 0
+
+    delete [] Z;
+    delete [] aca_Z;
+
+    #endif // 0
+
+	#if 0
+    if (print == 0) {
+
+        print = 1;
+
+        ofstream ofu("./output/tstu.txt");
+        ofstream ofv("./output/tstv.txt");
+        ofstream ofzaca("./output/tstzaca.txt");
+        ofstream ofz("./output/tstz.txt");
+
+        DComplex *Z = new DComplex [nrowclu*ncolclu];
+        for (int i=0;i<nrowclu;++i) {
+            for (int j=0;j<ncolclu;++j) {
+                Z[i+j*nrowclu] = intg.xfie(hm->rc->idx[i], hm->cc->idx[j], c);
+                ofz << Z[i+j*nrowclu] << " ";
+            }
+            ofz << endl;
+        }
+
+        DComplex *acaZ = new DComplex [nrowclu*ncolclu];
+        mmp_z(hm->r->U.a, CblasNoTrans, hm->r->V.a, CblasConjTrans, acaZ, nrowclu, hm->r->k, ncolclu);
+
+        for (int i=0;i<nrowclu;++i) {
+            for (int j=0;j<ncolclu;++j) {
+                ofzaca << acaZ[i+j*nrowclu] << " ";
+            }
+            ofzaca << endl;
+        }
+
+        for (int i=0;i<nrowclu;++i) {
+            for (int j=0;j<hm->r->k;++j) {
+                ofu << hm->r->U.a[i+j*nrowclu] << " ";
+            }
+            ofu << endl;
+        }
+        for (int i=0;i<ncolclu;++i) {
+            for (int j=0;j<hm->r->k;++j) {
+                ofv << hm->r->V.a[i+j*ncolclu] << " ";
+            }
+            ofv << endl;
+        }
+        ofu.close();
+        ofv.close();
+        ofzaca.close();
+        ofz.close();
+    }
+    #endif // 0
+}
+
+void
+FastBem::hca_m(phmatrix hm, const Integration &intg, const char c)
+{
+//    cout << hca_times++ << ": use HCA" << endl;
+
+    /** parameter for integral **/
+    const double freq(intg.get_freq());
+    const double lambda(Constants::SPEED_OF_LIGHT/freq);
+    const DComplex epsilon_r(1.0);
+    const DComplex wavenum = 2*PI*freq*(1.0/Constants::SPEED_OF_LIGHT)*sqrt(epsilon_r);
+
+    const double *rbox_min = hm->rc->bmin;
+    const double *rbox_max = hm->rc->bmax;
+    const double *cbox_min = hm->cc->bmin;
+    const double *cbox_max = hm->cc->bmax;
+
+    /**
+     ** fixed points number may be too small or too large
+     ** use the space resolution method to select the size adaptively
+     **/
+
+#if 1
+//    const double resolution(lambda*0.2);
+//
+//    const double rbox_xlen = rbox_max[0] - rbox_min[0];
+//    const double rbox_ylen = rbox_max[1] - rbox_min[1];
+//    const double rbox_zlen = rbox_max[2] - rbox_min[2];
+//    int nx = (int)(rbox_xlen/resolution) + 1;
+//    int ny = (int)(rbox_ylen/resolution) + 1;
+//    int nz = (int)(rbox_zlen/resolution) + 1;
+
+    const double rbox_xlen = rbox_max[0] - rbox_min[0];
+    const double rbox_ylen = rbox_max[1] - rbox_min[1];
+    const double rbox_zlen = rbox_max[2] - rbox_min[2];
+    int nx = get_inter_num(rbox_xlen, lambda);
+    int ny = get_inter_num(rbox_ylen, lambda);
+    int nz = get_inter_num(rbox_zlen, lambda);
+//    cout << nx << ", " << ny << ", " << nz << endl;
+#else
+    const int nx(inter_num);
+    const int ny(inter_num);
+    const int nz(inter_num);
+#endif // 0
+    const int rbox_nodes_num = nx*ny*nz;
+
+    /** build the point set for both row cluster and col cluster **/
+    vector<Point3D> rbox_nodes_set;
+    #if !USE_CHE
+    double dx = (rbox_max[0] - rbox_min[0]) / (nx+1);
+    for (int i=1;i<=nx;++i) {
+        double dy = (rbox_max[1]-rbox_min[1]) / (ny+1);
+        for (int j=1;j<=ny;++j) {
+            double dz = (rbox_max[2]-rbox_min[2]) / (nz+1);
+            for (int k=1;k<=nz;++k) {
+                Point3D newp(rbox_min[0]+i*dx, rbox_min[1]+j*dy, rbox_min[2]+k*dz);
+                rbox_nodes_set.push_back(newp);
+            }
+        }
+    }
+    #else
+    ChebItp3D row_cheb(nx, ny, nz);
+    double rxa = rbox_min[0], rxb = rbox_max[0];
+    double rya = rbox_min[1], ryb = rbox_max[1];
+    double rza = rbox_min[2], rzb = rbox_max[2];
+    for (int i=0;i<nx;++i) {
+        double px = row_cheb.get_cheb_point_x(i, rxa, rxb);
+        for (int j=0;j<ny;++j) {
+            double py = row_cheb.get_cheb_point_y(j, rya, ryb);
+            for (int k=0;k<nz;++k) {
+                double pz = row_cheb.get_cheb_point_z(k, rza, rzb);
+                rbox_nodes_set.push_back(Point3D(px, py, pz));
+            }
+        }
+    }
+    #endif
+#if 1
+//    const double cbox_xlen = cbox_max[0] - cbox_min[0];
+//    const double cbox_ylen = cbox_max[1] - cbox_min[1];
+//    const double cbox_zlen = cbox_max[2] - cbox_min[2];
+//    nx = (int)(cbox_xlen/resolution) + 1;
+//    ny = (int)(cbox_ylen/resolution) + 1;
+//    nz = (int)(cbox_zlen/resolution) + 1;
+
+    const double cbox_xlen = cbox_max[0] - cbox_min[0];
+    const double cbox_ylen = cbox_max[1] - cbox_min[1];
+    const double cbox_zlen = cbox_max[2] - cbox_min[2];
+    nx = get_inter_num(cbox_xlen, lambda);
+    ny = get_inter_num(cbox_ylen, lambda);
+    nz = get_inter_num(cbox_zlen, lambda);
+//    cout << nx << ", " << ny << ", " << nz << endl;
+#endif // 0
+    const int cbox_nodes_num = nx*ny*nz;
+
+    vector<Point3D> cbox_nodes_set;
+    #if !USE_CHE
+    dx = (cbox_max[0] - cbox_min[0]) / (nx+1);
+    for (int i=1;i<=nx;++i) {
+        double dy = (cbox_max[1]-cbox_min[1]) / (ny+1);
+        for (int j=1;j<=ny;++j) {
+            double dz = (cbox_max[2]-cbox_min[2]) / (nz+1);
+            for (int k=1;k<=nz;++k) {
+                Point3D newp(cbox_min[0]+i*dx, cbox_min[1]+j*dy, cbox_min[2]+k*dz);
+                cbox_nodes_set.push_back(newp);
+            }
+        }
+    }
+    #else
+    ChebItp3D col_cheb(nx, ny, nz);
+    double cxa = cbox_min[0], cxb = cbox_max[0];
+    double cya = cbox_min[1], cyb = cbox_max[1];
+    double cza = cbox_min[2], czb = cbox_max[2];
+    for (int i=0;i<nx;++i) {
+        for (int j=0;j<ny;++j) {
+            for (int k=0;k<nz;++k) {
+                double px = col_cheb.get_cheb_point_x(i, cxa, cxb);
+                double py = col_cheb.get_cheb_point_y(j, cya, cyb);
+                double pz = col_cheb.get_cheb_point_z(k, cza, czb);
+                cbox_nodes_set.push_back(Point3D(px, py, pz));
+            }
+        }
+    }
+    #endif
+
+
+
+//#if USE_RESOLUTION
+//    const double resolution(lambda*0.05);
+//
+//    const double rbox_xlen = rbox_max[0] - rbox_min[0];
+//    const double rbox_ylen = rbox_max[1] - rbox_min[1];
+//    const double rbox_zlen = rbox_max[2] - rbox_min[2];
+//    int nx = (int)(rbox_xlen/resolution) + 1;
+//    int ny = (int)(rbox_ylen/resolution) + 1;
+//    int nz = (int)(rbox_zlen/resolution) + 1;
+////    cout << nx << ", " << ny << ", " << nz << endl;
+//#else
+//    const int nx(INTP_ORDER);
+//    const int ny(INTP_ORDER);
+//    const int nz(INTP_ORDER);
+//#endif // 0
+//    const int rbox_nodes_num = nx*ny*nz;
+//
+//    /** build the point set for both row cluster and col cluster **/
+//    vector<Point3D> rbox_nodes_set;
+//    double dx = (rbox_max[0] - rbox_min[0]) / (nx+1);
+//    for (int i=1;i<=nx;++i) {
+//        double dy = (rbox_max[1]-rbox_min[1]) / (ny+1);
+//        for (int j=1;j<=ny;++j) {
+//            double dz = (rbox_max[2]-rbox_min[2]) / (nz+1);
+//            for (int k=1;k<=nz;++k) {
+//                Point3D newp(rbox_min[0]+i*dx, rbox_min[1]+j*dy, rbox_min[2]+k*dz);
+//                rbox_nodes_set.push_back(newp);
+//            }
+//        }
+//    }
+//#if USE_RESOLUTION
+//    const double cbox_xlen = cbox_max[0] - cbox_min[0];
+//    const double cbox_ylen = cbox_max[1] - cbox_min[1];
+//    const double cbox_zlen = cbox_max[2] - cbox_min[2];
+//    nx = (int)(cbox_xlen/resolution) + 1;
+//    ny = (int)(cbox_ylen/resolution) + 1;
+//    nz = (int)(cbox_zlen/resolution) + 1;
+////    cout << nx << ", " << ny << ", " << nz << endl;
+//#endif // 0
+//    const int cbox_nodes_num = nx*ny*nz;
+//
+//
+//    vector<Point3D> cbox_nodes_set;
+//    dx = (cbox_max[0] - cbox_min[0]) / (nx+1);
+//    for (int i=1;i<=nx;++i) {
+//        double dy = (cbox_max[1]-cbox_min[1]) / (ny+1);
+//        for (int j=1;j<=ny;++j) {
+//            double dz = (cbox_max[2]-cbox_min[2]) / (nz+1);
+//            for (int k=1;k<=nz;++k) {
+//                Point3D newp(cbox_min[0]+i*dx, cbox_min[1]+j*dy, cbox_min[2]+k*dz);
+//                cbox_nodes_set.push_back(newp);
+//            }
+//        }
+//    }
+    /** Preparation work for generating interpolation points finished **/
+
+    vector<int> row_idx; /// 我们有row & col Flags
+    vector<int> col_idx; /// So, 不需要额外加变量了? No
+    /** Preparation work for generating interpolation points finished **/
+
+    /** ACA required parameters **/
+    char norm = 'F';
+    int nrowclu(rbox_nodes_num);
+    int ncolclu(cbox_nodes_num);
+    int curRank(0);
+    double frbNormZ, frbNormZ_2, frbNormU, frbNormV;
+
+    /** record the current row and col index **/
+    int curRowNum, curColNum;
+
+    /**  allocate temp space  **/
+    vector<bool> flagRow(nrowclu, true);
+    vector<bool> flagCol(ncolclu, true);
+    vector<DComplex> resRowVal(ncolclu, 0);
+    vector<DComplex> resColVal(nrowclu, 0);
+
+    /** all operations on the rkmat **/
+    const prkmatrix rkmat = new_rkmatrix(rbox_nodes_num, cbox_nodes_num, 0);
+
+    /**Start from the first row**/
+    curRowNum = 0;
+    flagRow[curRowNum] = 0;
+    #pragma omp parallel for
+    for (int j=0;j<ncolclu;j++) resRowVal[j] = Green0(rbox_nodes_set[curRowNum], cbox_nodes_set[j], wavenum);
+
+    curColNum = get_next_idx_aca(resRowVal, flagCol);
+    if (curColNum == -1) return ;
+    /// The selected column may have invalid value, like -1.
+
+    #pragma omp parallel for
+    for (int i=0;i<nrowclu;i++) resColVal[i] = Green0(rbox_nodes_set[i], cbox_nodes_set[curColNum], wavenum);
+    if ( abs( resRowVal[curColNum] ) < 1e-20 )  return ;
+
+    row_idx.push_back(curRowNum);
+    col_idx.push_back(curColNum);
+
+    rkmat->V.a = new DComplex [ncolclu];
+    rkmat->U.a = new DComplex [nrowclu];
+
+    #pragma omp parallel for
+    for (int j=0;j<ncolclu;j++) rkmat->V.a[j] = resRowVal[j]/resRowVal[curColNum];
+    #pragma omp parallel for
+    for (int i=0;i<nrowclu;i++) rkmat->U.a[i] = resColVal[i];
+
+    frbNormV = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, ncolclu, 1, (MKL_Complex16 *)rkmat->V.a, ncolclu);
+    frbNormU = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, nrowclu, 1, (MKL_Complex16 *)rkmat->U.a, nrowclu);
+    frbNormZ = frbNormU * frbNormV;
+    frbNormZ_2 = frbNormZ * frbNormZ;
+
+    while ( frbNormU*frbNormV > aca_threshold*frbNormZ ) {
+        curRank++;
+
+        if((curRowNum = get_next_idx_aca(resColVal, flagRow)) == -1) {
+            curRank--;
+            break;
+        }
+
+        #pragma omp parallel for
+        for (int j=0;j<ncolclu;j++) {
+            resRowVal[j] = Green0(rbox_nodes_set[curRowNum], cbox_nodes_set[j], wavenum);
+            for (int i=0;i<curRank;i++) {
+                resRowVal[j] -= rkmat->U.a[curRowNum+i*nrowclu]*rkmat->V.a[j+i*ncolclu];
+            }
+        }
+
+        if ((curColNum = get_next_idx_aca(resRowVal, flagCol)) == -1) {
+            curRank--;
+            break;
+        }
+
+        #pragma omp parallel for
+        for (int i=0;i<nrowclu;i++) {
+            resColVal[i] = Green0(rbox_nodes_set[i], cbox_nodes_set[curColNum], wavenum);
+            for (int j=0;j<curRank;j++) {
+                resColVal[i] -= rkmat->U.a[i+j*nrowclu] * rkmat->V.a[curColNum+j*ncolclu];
+            }
+        }
+
+        rkmat->V.a = (DComplex *) realloc(rkmat->V.a, (curRank+1)*ncolclu*sizeof(DComplex));
+        rkmat->U.a = (DComplex *) realloc(rkmat->U.a, (curRank+1)*nrowclu*sizeof(DComplex));
+
+        row_idx.push_back(curRowNum);
+        col_idx.push_back(curColNum);
+
+        #pragma omp parallel for
+        for (int j=0;j<ncolclu;j++) rkmat->V.a[j+curRank*ncolclu] = resRowVal[j]/resRowVal[curColNum];
+        #pragma omp parallel for
+        for (int i=0;i<nrowclu;i++) rkmat->U.a[i+curRank*nrowclu] = resColVal[i];
+
+        frbNormV = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, ncolclu, 1, (MKL_Complex16 *)rkmat->V.a+curRank*ncolclu, ncolclu);
+        frbNormU = LAPACKE_zlange(LAPACK_COL_MAJOR, norm, nrowclu, 1, (MKL_Complex16 *)rkmat->U.a+curRank*nrowclu, nrowclu);
+
+        for (int i=0;i<curRank;i++) {
+            DComplex c1, c2;
+            cblas_zdotc_sub(nrowclu, rkmat->U.a+i*nrowclu, 1, rkmat->U.a+curRank*nrowclu, 1, &c1);
+            cblas_zdotc_sub(ncolclu, rkmat->V.a+i*ncolclu, 1, rkmat->V.a+curRank*ncolclu, 1, &c2);
+            frbNormZ_2 += 2*abs( c1 )*abs( c2 );
+        }
+
+        frbNormZ_2 += frbNormU*frbNormU*frbNormV*frbNormV;
+        frbNormZ = sqrt(frbNormZ_2);
+    }
+
+    del_rkmatrix(rkmat);
+
+    curRank ++;
+    nrowclu = hm->rc->size;
+    ncolclu = hm->cc->size;
+//    cout << "m = " << nrowclu << ", n = " << ncolclu << ", rank = " << curRank << endl;
+
+    #if 0
+    for (vector<int>::iterator it=row_idx.begin();it!=row_idx.end();++it) {
+        cout << *it << " ";
+        if (it+1 == row_idx.end()) cout << endl;
+    }
+    #endif // 0
+
+    DComplex *S = new DComplex [curRank*curRank];
+
+    #pragma omp parallel for
+    for (int i=0;i<curRank;++i) {
+        for (int j=0;j<curRank;++j) {
+            S[i+j*curRank] = Green0(rbox_nodes_set[row_idx[i]], cbox_nodes_set[col_idx[j]], wavenum);
+        }
+    }
+
+    vector<int> srow_flag(curRank, 1);
+    vector<int> scol_flag(curRank, 1);
+    vector<int> new_row_idx;
+    vector<int> new_col_idx;
+    int new_rank(0);
+
+    new_rank = full_col_pivot_aca(S, srow_flag, scol_flag);
+
+    for (int i=0;i<curRank;++i) {
+        if (srow_flag[i]==0) new_row_idx.push_back(row_idx[i]);
+        if (scol_flag[i]==0) new_col_idx.push_back(col_idx[i]);
+    } /// wanna to use openmp, but failed. Why!?
+
+//    cout << "Real rank = " << new_rank << endl;
+
+    DComplex *tS = new DComplex [new_rank*new_rank];
+
+    int ts_row(0);
+    for (int i=0;i<curRank;++i) {
+        if (!srow_flag[i]) {
+            int ts_col = 0;
+            for (int j=0;j<curRank;++j) {
+                if (!scol_flag[j]) {
+                    tS[ts_row+ts_col*new_rank] = S[i+j*curRank];
+                    ts_col++;
+                }
+            }
+            ts_row++;
+        }
+    } /// wanna to use openmp, but failed. Why!?
+
+    matInv_z(tS, new_rank);
+
+    Complex3D *newa_vec = new Complex3D [new_rank*nrowclu];
+    Complex3D *newb_vec = new Complex3D [new_rank*ncolclu];
+
+    prkmatrix rk_vec_x = new_rkmatrix(nrowclu, ncolclu, new_rank);
+    prkmatrix rk_vec_y = new_rkmatrix(nrowclu, ncolclu, new_rank);
+    prkmatrix rk_vec_z = new_rkmatrix(nrowclu, ncolclu, new_rank);
+
+    #pragma omp parallel for
+    for (int j=0;j<new_rank;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            newa_vec[i+nrowclu*j] = intg.single_layer_intg_m1(hm->rc->idx[i], cbox_nodes_set[new_col_idx[j]]);
+        }
+        for (int i=0;i<ncolclu;++i) {
+            newb_vec[i+ncolclu*j] = intg.single_layer_intg_m2(hm->cc->idx[i], rbox_nodes_set[new_row_idx[j]]);
+        }
+    }
+
+    #if 0
+
+    DComplex *tst = new DComplex [nrowclu*ncolclu];
+    int real_rank = min(nrowclu, ncolclu);
+    double *sigma = new double [real_rank];
+    double *work = new double [max(nrowclu, ncolclu)];
+
+    for (int j=0;j<ncolclu;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            tst[i+j*nrowclu] = 0;
+            for (int k=0;k<curRank;k++) {
+                tst[i+j*nrowclu] += dotprod(newa_vec[i+nrowclu*k], newb_vec[j+ncolclu*k]);
+            }
+        }
+    }
+
+    MKL_Complex16 *u, *vt;
+    LAPACKE_zgesvd(h2_col_major, 'N', 'N', nrowclu, ncolclu, (MKL_Complex16 *)tst, nrowclu, sigma, u, 1, vt, 1, work);
+//    for (int i=0;i<real_rank;++i)
+//        cout << i<< ": " << sigma[i] << endl;
+
+    delete [] tst;
+    delete [] sigma;
+    delete [] work;
+    #endif // 1
+
+    #pragma omp parallel for
+    for (int j=0;j<new_rank;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            rk_vec_x->U.a[i+nrowclu*j] = newa_vec[i+nrowclu*j][0];
+            rk_vec_y->U.a[i+nrowclu*j] = newa_vec[i+nrowclu*j][1];
+            rk_vec_z->U.a[i+nrowclu*j] = newa_vec[i+nrowclu*j][2];
+        }
+        for (int i=0;i<ncolclu;++i) {
+            rk_vec_x->V.a[i+ncolclu*j] = newb_vec[i+ncolclu*j][0];
+            rk_vec_y->V.a[i+ncolclu*j] = newb_vec[i+ncolclu*j][1];
+            rk_vec_z->V.a[i+ncolclu*j] = newb_vec[i+ncolclu*j][2];
+        }
+    }
+
+    #if 0
+    hm->r->U.a = new DComplex [3*new_rank*nrowclu];
+    hm->r->V.a = new DComplex [3*new_rank*ncolclu];
+    DComplex * const U = hm->r->U.a;
+    DComplex * const V = hm->r->V.a;
+
+    mmp_z(rk_vec_x->U.a, CblasNoTrans, tS, CblasNoTrans, U, nrowclu, new_rank, new_rank);
+    mmp_z(rk_vec_y->U.a, CblasNoTrans, tS, CblasNoTrans, U+new_rank*nrowclu, nrowclu, new_rank, new_rank);
+    mmp_z(rk_vec_z->U.a, CblasNoTrans, tS, CblasNoTrans, U+2*new_rank*nrowclu, nrowclu,new_rank, new_rank);
+
+    #pragma omp parallel for
+    for (int j=0;j<new_rank;++j) {
+        for (int i=0;i<ncolclu;++i) {
+            V[i+ncolclu*j] = rk_vec_x->V.a[i+ncolclu*j];
+            V[i+ncolclu*(j+new_rank)] = rk_vec_y->V.a[i+ncolclu*j];
+            V[i+ncolclu*(j+2*new_rank)] = rk_vec_z->V.a[i+ncolclu*j];
+        }
+    }
+
+    hm->r->k = 3*new_rank;
+    hm->r->U.rows = nrowclu;
+    hm->r->U.cols = hm->r->k;
+    hm->r->V.rows = ncolclu;
+	hm->r->V.cols = hm->r->k;
+    conj_amatrix(&(hm->r->V));
+	#else
+
+    hm->r->U.a = new DComplex [new_rank*nrowclu];
+    hm->r->V.a = new DComplex [new_rank*ncolclu];
+    DComplex * const U = hm->r->U.a;
+    DComplex * const V = hm->r->V.a;
+
+    prkmatrix rk_vec_nx = new_rkmatrix(nrowclu, ncolclu, new_rank);
+    prkmatrix rk_vec_ny = new_rkmatrix(nrowclu, ncolclu, new_rank);
+    prkmatrix rk_vec_nz = new_rkmatrix(nrowclu, ncolclu, new_rank);
+    copy_rkmatrix(0, rk_vec_x, rk_vec_nx);
+    copy_rkmatrix(0, rk_vec_y, rk_vec_ny);
+    copy_rkmatrix(0, rk_vec_z, rk_vec_nz);
+
+    mmp_z(rk_vec_x->U.a, CblasNoTrans, tS, CblasNoTrans, rk_vec_nx->U.a, nrowclu, new_rank, new_rank);
+    mmp_z(rk_vec_y->U.a, CblasNoTrans, tS, CblasNoTrans, rk_vec_ny->U.a, nrowclu, new_rank, new_rank);
+    mmp_z(rk_vec_z->U.a, CblasNoTrans, tS, CblasNoTrans, rk_vec_nz->U.a, nrowclu, new_rank, new_rank);
+
+    conj_amatrix(&(rk_vec_nx->V));
+    conj_amatrix(&(rk_vec_ny->V));
+    conj_amatrix(&(rk_vec_nz->V));
+    add_rkmatrix_keep_rank(1.0, rk_vec_nx, rk_vec_ny);
+    add_rkmatrix_keep_rank(1.0, rk_vec_ny, rk_vec_nz);
+//    ptruncmode tm = new_truncmode();
+//    add_rkmatrix(1.0, rk_vec_ny, tm, 1e-5, rk_vec_nz);
+
+    #pragma omp parallel for
+    for (int j=0;j<new_rank;++j) {
+        for (int i=0;i<nrowclu;++i) {
+            U[i+j*nrowclu] = rk_vec_nz->U.a[i+j*nrowclu];
+        }
+    }
+
+    #pragma omp parallel for
+    for (int j=0;j<new_rank;++j) {
+        for (int i=0;i<ncolclu;++i) {
+            V[i+ncolclu*j] = rk_vec_nz->V.a[i+ncolclu*j];
+        }
+    }
+
+    hm->r->k = new_rank;
+    hm->r->U.rows = nrowclu;
+    hm->r->U.cols = hm->r->k;
+    hm->r->V.rows = ncolclu;
+	hm->r->V.cols = hm->r->k;
+
+    del_rkmatrix(rk_vec_nx);
+    del_rkmatrix(rk_vec_ny);
+    del_rkmatrix(rk_vec_nz);
+    #endif // 0
+
+    delete [] S;
+    delete [] tS;
+    delete [] newa_vec;
+    delete [] newb_vec;
+    del_rkmatrix(rk_vec_x);
+    del_rkmatrix(rk_vec_y);
+    del_rkmatrix(rk_vec_z);
+
+    #if TST_HMATRIX_ERROR
+    /** Full SVD to verify the performance of ACA **/
+    /** Or just to compute the error matrix ||Z-Z^hat||2 directly  **/
+    DComplex *Z = new DComplex [nrowclu*ncolclu];
+    DComplex *aca_Z = new DComplex [nrowclu*ncolclu];
+
+    mmp_z(hm->r->U.a, CblasNoTrans, hm->r->V.a, CblasConjTrans, aca_Z, nrowclu, hm->r->k, ncolclu);
+    #pragma omp parallel for
+    for (int i=0;i<nrowclu;++i) {
+        for (int j=0;j<ncolclu;++j) {
+            Z[i+j*nrowclu] = intg.xfie(hm->rc->idx[i], hm->cc->idx[j], c);
+        }
+    }
+    for (int i=0;i<nrowclu;++i) {
+        for (int j=0;j<ncolclu;++j) {
+            DComplex tmp = Z[i+j*nrowclu];
+            frob_norm_2_total += abs(tmp*tmp);
+            tmp -= aca_Z[i+j*nrowclu];
+            frob_norm_error_2_abs += abs(tmp*tmp);
+        }
+    }
+    delete [] Z;
+    delete [] aca_Z;
+    #endif // 0
+
+	#if 1
+    if (print == 0) {
+
+        print = 1;
+
+        ofstream mats_real("./output/mats_real.txt");
+        ofstream mats_imag("./output/mats_imag.txt");
+
+        for (int i=0;i<new_rank;++i) {
+            for (int j=0;j<new_rank;++j) {
+                mats_real << scientific << tS[i+j*new_rank].real() << " ";
+                mats_imag << scientific << tS[i+j*new_rank].imag() << " ";
+            }
+            mats_real << endl;
+            mats_imag << endl;
+        }
+
+        mats_real.close();
+        mats_imag.close();
+
+        ofstream ofu("./output/tstu.txt");
+        ofstream ofv("./output/tstv.txt");
+        ofstream ofzaca("./output/tstzaca.txt");
+        ofstream ofz("./output/tstz.txt");
+
+        DComplex *Z = new DComplex [nrowclu*ncolclu];
+        for (int i=0;i<nrowclu;++i) {
+            for (int j=0;j<ncolclu;++j) {
+                Z[i+j*nrowclu] = intg.xfie(hm->rc->idx[i], hm->cc->idx[j], c);
+                ofz << Z[i+j*nrowclu] << " ";
+            }
+            ofz << endl;
+        }
+
+        DComplex *acaZ = new DComplex [nrowclu*ncolclu];
+        mmp_z(hm->r->U.a, CblasNoTrans, hm->r->V.a, CblasConjTrans, acaZ, nrowclu, hm->r->k, ncolclu);
+
+        for (int i=0;i<nrowclu;++i) {
+            for (int j=0;j<ncolclu;++j) {
+                ofzaca << acaZ[i+j*nrowclu] << " ";
+            }
+            ofzaca << endl;
+        }
+
+        for (int i=0;i<nrowclu;++i) {
+            for (int j=0;j<hm->r->k;++j) {
+                ofu << hm->r->U.a[i+j*nrowclu] << " ";
+            }
+            ofu << endl;
+        }
+        for (int i=0;i<ncolclu;++i) {
+            for (int j=0;j<hm->r->k;++j) {
+                ofv << hm->r->V.a[i+j*ncolclu] << " ";
+            }
+            ofv << endl;
+        }
+        ofu.close();
+        ofv.close();
+        ofzaca.close();
+        ofz.close();
+    }
+    #endif // 0
+}
